@@ -25,13 +25,15 @@
 #define INT_TYPE_SIZE (sizeof(INT_TYPE) * 8)
 #define CELL_VAL_SIZE 1
 #define MAX_BDIM 8
-#define MAX_WORKLOAD 200
-#define MIN_WORKLOAD 100
-#define NODES_PER_MESSAGE 10
+#define MAX_WORKLOAD 4000
+#define MIN_WORKLOAD 3500
+#define MAX_NODES_PER_MESSAGE 20
+#define COORD_SEND_NODES_AMOUNT 4
 #define TAG_SIZE 1
 #define TAG_NEW_JOB 2
 #define TAG_ADD_NODES 3
 #define TAG_SOLVED 4
+#define TAG_TERMINATED 5
 
 enum SOLVE_STRATEGY {SUDOKU_SOLVE, SUDOKU_COUNT_SOLS};
 
@@ -43,6 +45,7 @@ enum SOLVE_STRATEGY {SUDOKU_SOLVE, SUDOKU_COUNT_SOLS};
 
 int mpi_rank, mpi_size;
 dynarray *node_stack;
+MPI_Request solved_request;
 
 void BUILD_TIME_CHECKS()
 {
@@ -451,20 +454,26 @@ static void display(sudoku *s)
     printf("\n");
 }
 
-static int search (sudoku *s, int status)
+static int search (sudoku *s, int status, int *workload)
 {
-    int i, j, k;
+    int flag;
+    MPI_Test(&solved_request, &flag, MPI_STATUS_IGNORE);
+
+    if(flag)
+    {
+        return 1;
+    }
 
     if(!status)
     {
-        return status;
+        return 0;
     }
 
     int solved = 1;
 
-    for(i = 0; solved && i < s->dim; i++)
+    for(int i = 0; solved && i < s->dim; i++)
     { 
-        for(j = 0; j < s->dim; j++)
+        for(int j = 0; j < s->dim; j++)
         { 
             if(cell_v_count(&s->values[i][j]) != 1)
             {
@@ -477,9 +486,17 @@ static int search (sudoku *s, int status)
 
     if(solved)
     {
-        s->sol_count++;
+        char solved_buffer[s->grid_size * sizeof(cell_v)];
+        void *buffer_pos = solved_buffer;
 
-        return SUDOKU_SOLVE_STRATEGY == SUDOKU_SOLVE;
+        for(int i = 0; i < s->dim; i++, buffer_pos += s->dim * sizeof(cell_v))
+        {
+            memcpy(buffer_pos, s->values[i], s->dim * sizeof(cell_v));
+        }
+
+        MPI_Send(solved_buffer, s->grid_size * sizeof(cell_v), MPI_BYTE, 0, TAG_SOLVED, MPI_COMM_WORLD);
+
+        return 1;
     }
 
     int min = INT_MAX;
@@ -487,16 +504,16 @@ static int search (sudoku *s, int status)
     int minJ = -1;
     int ret = 0;
     
-    cell_v **values_bkp = malloc (sizeof (cell_v *) * s->dim);
+    cell_v **values_bkp = malloc(sizeof(cell_v *) * s->dim);
 
-    for (i = 0; i < s->dim; i++)
+    for(int i = 0; i < s->dim; i++)
     {
-        values_bkp[i] = malloc (sizeof (cell_v) * s->dim);
+        values_bkp[i] = malloc(sizeof(cell_v) * s->dim);
     }
     
-    for (i = 0; i < s->dim; i++)
+    for(int i = 0; i < s->dim; i++)
     { 
-        for (j = 0; j < s->dim; j++)
+        for(int j = 0; j < s->dim; j++)
         {
             int used = cell_v_count(&s->values[i][j]);
 
@@ -508,40 +525,74 @@ static int search (sudoku *s, int status)
             }
         }
     }
-            
-    for(k = 1; k <= s->dim; k++)
+
+    for(int i = 0; i < s->dim; i++)
+    {
+        for(int j = 0; j < s->dim; j++)
+        {
+            values_bkp[i][j] = s->values[i][j];
+        }
+    }
+
+    Node *node = NULL;
+
+    for(int k = 1; k <= s->dim; k++)
     {
         if(cell_v_get(&s->values[minI][minJ], k))
-        {
-            for(i = 0; i < s->dim; i++)
+        {            
+            if(*workload)
             {
-                for(j = 0; j < s->dim; j++)
+                *workload = *workload - 1;
+                if(search(s, assign(s, minI, minJ, k), workload))
                 {
-                    values_bkp[i][j] = s->values[i][j];
-                }
-            }
-            
-            if (search (s, assign(s, minI, minJ, k)))
-            {
-                ret = 1;
+                    ret = 1;
 
-                goto FR_RT;
+                    goto FR_RT;
+                }
+                else
+                {
+                    for(int i = 0; i < s->dim; i++)
+                    {
+                        for (int j = 0; j < s->dim; j++)
+                        {
+                            s->values[i][j] = values_bkp[i][j];
+                        }
+                    }
+                }                
             }
             else
             {
-                for(i = 0; i < s->dim; i++)
+                node = malloc(sizeof(Node));
+                node->values = malloc(sizeof(cell_v *) * s->dim);
+
+                for(int i = 0; i < s->dim; i++)
                 {
-                    for (j = 0; j < s->dim; j++)
+                    node->values[i] = malloc(sizeof(cell_v) * s->dim);
+                }
+
+                for(int i = 0; i < s->dim; i++)
+                {
+                    for (int j = 0; j < s->dim; j++)
                     {
-                        s->values[i][j] = values_bkp[i][j];
+                        node->values[i][j] = s->values[i][j];
                     }
                 }
+
+                node->digit = k;
+                node->sqrI = minI;
+                node->sqrJ = minJ;
+                node->digits_count = min;
+                node->dim = s->dim;
+
+                dynarray_add_tail(node_stack, node);
+
+                node = NULL;
             }
         }
     }
     
     FR_RT:
-    for (i = 0; i < s->dim; i++)
+    for (int i = 0; i < s->dim; i++)
     {
         free(values_bkp[i]);
     }
@@ -555,7 +606,7 @@ int solve_sudoku(sudoku *s)
 {
     int workload_bkp = MIN_WORKLOAD + (rand() % (MAX_WORKLOAD - MIN_WORKLOAD + 1));
     int workload = 0;
-
+    MPI_Irecv(NULL, 0, MPI_BYTE, 0, TAG_SOLVED, MPI_COMM_WORLD, &solved_request);
     node_stack = dynarray_create(s->grid_size * s->grid_size);
     Node *node;
 
@@ -563,7 +614,7 @@ int solve_sudoku(sudoku *s)
     {
         int values_size = s->grid_size * sizeof(cell_v);
         int node_size = values_size + 4; //+4: d + i + j + digits_count (4 bytes no total)
-        int msg_size = node_size * NODES_PER_MESSAGE + 1; //+1: 1 byte para indicar quantos nós foram enviados
+        int msg_size = node_size * MAX_NODES_PER_MESSAGE + 1; //+1: 1 byte para indicar quantos nós foram enviados/recebidos (nodes_amount)
         char msg_buffer[msg_size];
         void *buffer_pos;
         int nodes_amount;
@@ -578,10 +629,10 @@ int solve_sudoku(sudoku *s)
                 MPI_Recv(msg_buffer, msg_size, MPI_BYTE, 0, TAG_NEW_JOB, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
 
                 nodes_amount = msg_buffer[msg_size - 1];
-                buffer_pos = msg_buffer;
 
                 for(int i = nodes_amount - 1; i >= 0; i--)
                 {
+                    buffer_pos = msg_buffer + i * node_size;
                     node = malloc(sizeof(Node));
                     node->values = malloc(sizeof(cell_v*) * s->dim);
 
@@ -600,14 +651,12 @@ int solve_sudoku(sudoku *s)
                     node->sqrJ = *(char*)buffer_pos++;
                     node->digits_count = *(char*)buffer_pos++;
 
-                    printf("%d %d %d %d\n", node->digit, node->sqrI, node->sqrJ, node->digits_count);
                     dynarray_add_tail(node_stack, node);
 
                     node = NULL;
                 }
             }
 
-            
             while(1)
             {
                 if(!dynarray_get_count(node_stack))
@@ -617,6 +666,13 @@ int solve_sudoku(sudoku *s)
                 }
                 
                 node = dynarray_remove_tail(node_stack);
+
+                if(!node)
+                {
+                    printf("solve_sudoku: nó nulo encontrado na stack...\n");
+                    continue;
+                }
+
                 s->values = node->values;
                 
                 if(!assign(s, node->sqrI, node->sqrJ, node->digit))
@@ -632,14 +688,10 @@ int solve_sudoku(sudoku *s)
                     continue;
                 }
                 
-                
                 if(search(s, 1, &workload))
                 {
+                    destroy_sudoku(s);
                     return 1;
-                }
-                else
-                {
-                    continue;
                 }
                 
                 if(!workload)
@@ -649,14 +701,14 @@ int solve_sudoku(sudoku *s)
                         nodes_amount = 0;
                         buffer_pos = msg_buffer;
 
-                        for(int i = 0; i < NODES_PER_MESSAGE; i++)
+                        for(int i = 0; i < MAX_NODES_PER_MESSAGE; i++)
                         {
                             node = dynarray_remove_tail(node_stack);
 
                             if(!node)
                             {
-                                printf("sudoku_solve: nó nulo encontrado na stack...\n");
-                                continue;
+                                //printf("sudoku_solve: nó nulo encontrado na stack...\n");
+                                break;
                             }
 
                             for(int j = 0; j < s->dim; j++, buffer_pos += s->dim * sizeof(cell_v))
@@ -682,6 +734,8 @@ int solve_sudoku(sudoku *s)
                         }
 
                         msg_buffer[msg_size - 1] = nodes_amount;
+                        
+                        //printf("Processo %d\t envia %d\t nós ao processo 0\t\n", mpi_rank, nodes_amount);
 
                         MPI_Send(msg_buffer, msg_size, MPI_BYTE, 0, TAG_ADD_NODES, MPI_COMM_WORLD);
                     }
@@ -689,9 +743,7 @@ int solve_sudoku(sudoku *s)
                 }
 
             }
-        }
-        
-        destroy_sudoku(s);
+        }        
     }
     else
     {
@@ -724,8 +776,7 @@ unsigned int get_node_value(Node *node)
     double possib_digits_sqr_ratio = node->digits_count / (double) (node->dim);
     double possib_digits_board_ratio = 1.0 - current_possible_values_sum / (double) max_possible_values_sum;
 
-    printf("get_node_value says: %d ... %u\n", node->digits_count, (unsigned int)((0.7 * possib_digits_board_ratio + 0.3 * possib_digits_sqr_ratio) * UINT_MAX));
-    return (unsigned int)((0.7 * possib_digits_board_ratio + 0.3 * possib_digits_sqr_ratio) * UINT_MAX);
+    return (unsigned int)((0.8 * possib_digits_board_ratio + 0.2 * possib_digits_sqr_ratio) * UINT_MAX);
 }
 
 int coordinate(sudoku *s)
@@ -780,10 +831,13 @@ int coordinate(sudoku *s)
     MPI_Status status;
     int values_size = s->grid_size * sizeof(cell_v);
     int node_size = values_size + 4; //+4: d + i + j + digits_count (4 bytes no total)
-    int msg_size = node_size * NODES_PER_MESSAGE + 1; //+1: 1 byte para indicar quantos nós foram enviados
+    int msg_size = node_size * MAX_NODES_PER_MESSAGE + 1; //+1: 1 byte para indicar quantos nós foram enviados
     char msg_buffer[msg_size];
     void *buffer_pos;
+    char solved_buffer[values_size];
     int nodes_amount;
+    int already_solved = 0;
+    int processes_terminated = 0;
 
     do
     {
@@ -797,7 +851,7 @@ int coordinate(sudoku *s)
                 nodes_amount = 0;
                 buffer_pos = msg_buffer;
 
-                for(int i = 0; i < NODES_PER_MESSAGE; i++)
+                for(int i = 0; i < COORD_SEND_NODES_AMOUNT; i++)
                 {
                     node = minheap_remove_min(nodes);
 
@@ -863,41 +917,57 @@ int coordinate(sudoku *s)
                     node->digits_count = *(char*)buffer_pos++;
                     node->dim = s->dim;
 
-                    printf("coord: %d %d %d %d\n", node->digit, node->sqrI, node->sqrJ, node->digits_count);
                     minheap_add(nodes, node, get_node_value(node));
 
                     node = NULL;
                 }
                 break;
-            /*
+            
             case TAG_SOLVED:
-                MPI_Recv(&solved_buf, s->grid_size, MPI_BYTE, status.MPI_SOURCE, TAG_SOLVED, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+                if(!already_solved)
+                {
+                    already_solved = 1;
+                }    
+                else
+                {
+                    break;
+                }
+
+                MPI_Recv(&solved_buffer, values_size, MPI_BYTE, status.MPI_SOURCE, TAG_SOLVED, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
 
                 printf("Puzzle resolvido pelo processo %d:\n", status.MPI_SOURCE);
 
-                for(int i = 0; i < s->dim; i++)
+                buffer_pos = solved_buffer;
+
+                for(int i = 0; i < s->dim; i++, buffer_pos += s->dim * sizeof(cell_v))
                 {
-                    for(int j = 0; j < s->dim; j++)
-                    {
-                        printf("%d ", solved_buf[i * s->dim + j]);
-                    }
-                    puts("");
+                    memcpy(s->values[i], buffer_pos, s->dim * sizeof(cell_v));    
                 }
-                puts("");
-                clocks = clock() - clocks;
-                printf("%LF\n", (long double)clocks / CLOCKS_PER_SEC);
-                MPI_Abort(MPI_COMM_WORLD, MPI_SUCCESS);
 
-                return 1;
+                //display(s);
 
+                for(int i = 1; i < mpi_size; i++)
+                {
+                    MPI_Send(NULL, 0, MPI_BYTE, i, TAG_SOLVED, MPI_COMM_WORLD);                        
+                }
+
+                break;
+
+            case TAG_TERMINATED:
+                MPI_Recv(NULL, 0, MPI_BYTE, status.MPI_SOURCE, TAG_TERMINATED, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+
+                processes_terminated++;
+
+                if(processes_terminated == mpi_size - 1)
+                {
+                    return 1;
+                }
                 break;
 
             default:
                 printf("switch case erro inesperado (MPI_TAG = %d)\n", status.MPI_TAG);
                 break;
-            */
         }
-
     }
     while(minheap_get_count(nodes));
 
@@ -965,56 +1035,9 @@ int main (int argc, char **argv)
         sudoku *s = create_sudoku(size, NULL);
         
         solve_sudoku(s);
-        /*
-        int msg_size = s->grid_size * sizeof(cell_v);
-        char msg_buffer[msg_size];
-
-        MPI_Recv(msg_buffer, msg_size, MPI_BYTE, 0, TAG_SIZE, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
-
-        void *buffer_pos = msg_buffer;
-        for(int i = 0; i < s->dim; i++, buffer_pos += s->dim * sizeof(cell_v))
-        {
-            memcpy(s->values[i], buffer_pos, s->dim * sizeof(cell_v));
-        }
-        */
-
-        /*
-        if(s)
-        {
-            solve(s);
-
-            if(s->sol_count)
-            {
-                switch (SUDOKU_SOLVE_STRATEGY)
-                {
-                    case SUDOKU_SOLVE:
-                        display(s);
-
-                        break;
-
-                    case SUDOKU_COUNT_SOLS: 
-                        printf("%lld\n", s->sol_count);
-
-                        break;
-
-                    default:
-                        assert(0);
-                }
-            }
-            else 
-            {
-                printf("Could not solve puzzle.\n");
-            }
-
-            destroy_sudoku(s);
-        }
-        else
-        {
-            printf("Could not load puzzle.\n");
-        }
-        */
     }
 
+    MPI_Send(NULL, 0, MPI_BYTE, 0, TAG_TERMINATED, MPI_COMM_WORLD);
     MPI_Finalize();
 
     return 0;
