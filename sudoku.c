@@ -957,11 +957,12 @@ int coordinate(sudoku *s)
                 MPI_Recv(NULL, 0, MPI_BYTE, status.MPI_SOURCE, TAG_TERMINATED, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
 
                 processes_terminated++;
-
+                printf("%d %d\n", processes_terminated, mpi_size - 1);
                 if(processes_terminated == mpi_size - 1)
                 {
                     return 1;
                 }
+
                 break;
 
             default:
@@ -1037,7 +1038,11 @@ int main (int argc, char **argv)
         solve_sudoku(s);
     }
 
-    MPI_Send(NULL, 0, MPI_BYTE, 0, TAG_TERMINATED, MPI_COMM_WORLD);
+    if(mpi_rank)
+    {
+        MPI_Send(NULL, 0, MPI_BYTE, 0, TAG_TERMINATED, MPI_COMM_WORLD);
+    }
+
     MPI_Finalize();
 
     return 0;
