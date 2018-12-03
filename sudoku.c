@@ -944,7 +944,7 @@ int coordinate(sudoku *s)
                     memcpy(s->values[i], buffer_pos, s->dim * sizeof(cell_v));    
                 }
 
-                //display(s);
+                display(s);
 
                 for(int i = 1; i < mpi_size; i++)
                 {
