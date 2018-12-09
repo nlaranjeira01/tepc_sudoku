@@ -1046,7 +1046,7 @@ int coordinate(sudoku *s)
                 fprintf(results, "%d,%d,%d,%d,%d,%d,%lf\n", MAX_WORKLOAD, MIN_WORKLOAD, MAX_NODES_PER_MESSAGE, COORD_SEND_NODES_AMOUNT, mpi_size, N_THREADS, elapsed_time);
                 fclose(results);
 
-                MPI_Abort(MPI_COMM_WORLD, MPI_SUCCESS);
+                //MPI_Abort(MPI_COMM_WORLD, MPI_SUCCESS);
 
                 for(int i = 0; i < s->dim; i++, buffer_pos += s->dim * sizeof(cell_v))
                 {
