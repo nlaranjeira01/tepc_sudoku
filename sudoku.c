@@ -717,8 +717,6 @@ int solve_sudoku(sudoku *s)
     {
         threadArgs[i].s = malloc(sizeof(sudoku));
         memcpy(threadArgs[i].s, s, sizeof(sudoku));
-
-        printf("aahhahaha %d\n", threadArgs[i].s->dim);
     }
 
     if(s)
