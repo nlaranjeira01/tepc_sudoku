@@ -1,16 +1,3 @@
-/*
- * Emilio Francesquini <francesquini@gmail.com>
- * 
- * https://github.com/francesquini/sudoku
-
- * This is a sequential Sudoku solver which uses Peter Norvig’s
- * constraint propagation method (http://norvig.com/sudoku.html).
- *
- * This was one of the problems used during the 11th Marathon of Parallel Programming
- * http://lspd.mackenzie.br/marathon/16/index.html
- */
-
-
 #include <stdio.h>
 #include <time.h>
 #include <stdlib.h>
@@ -20,33 +7,14 @@
 #include <string.h>
 #include <mpi.h>
 #include <sys/time.h>
+#include <ctype.h>
+#include <errno.h>
 #include "minheap.h"
 
 #define INT_TYPE unsigned long long 
 #define INT_TYPE_SIZE (sizeof(INT_TYPE) * 8)
 #define CELL_VAL_SIZE 1
 #define MAX_BDIM 8
-
-#ifndef MAX_WORKLOAD
-    #define MAX_WORKLOAD 1000
-#endif
-
-#ifndef MIN_WORKLOAD
-    #define MIN_WORKLOAD 500
-#endif
-
-#ifndef MAX_NODES_PER_MESSAGE
-    #define MAX_NODES_PER_MESSAGE 5
-#endif
-
-#ifndef COORD_SEND_NODES_AMOUNT
-    #define COORD_SEND_NODES_AMOUNT 4
-#endif
-
-#ifndef N_THREADS
-    #define N_THREADS 1
-#endif
-
 #define TAG_SIZE 1
 #define TAG_NEW_JOB 2
 #define TAG_ADD_NODES 3
@@ -55,13 +23,20 @@
 
 enum SOLVE_STRATEGY {SUDOKU_SOLVE, SUDOKU_COUNT_SOLS};
 
+typedef enum {
+    STR2INT_SUCCESS,
+    STR2INT_OVERFLOW,
+    STR2INT_UNDERFLOW,
+    STR2INT_INCONVERTIBLE
+} str2int_errno;
+
 #ifndef SUDOKU_SOLVE_STRATEGY
     #define SUDOKU_SOLVE_STRATEGY SUDOKU_SOLVE
 #endif
 
 #define BUILD_ERROR_IF(condition) ((void)sizeof(char[1 - 2*!!(condition)]))
 
-int mpi_rank, mpi_size, stop_threads = 0;
+int mpi_rank, mpi_size, max_workload, min_workload, max_nodes_per_message, coord_send_nodes_amount, n_threads, stop_threads = 0;
 dynarray *node_stack;
 MPI_Request solved_request;
 pthread_mutex_t solved_lock;
@@ -698,12 +673,11 @@ void *thread_search(void *_args)
 
 int solve_sudoku(sudoku *s)
 {
-    int workload_bkp = MIN_WORKLOAD + (rand() % (MAX_WORKLOAD - MIN_WORKLOAD + 1));
+    int workload_bkp = min_workload + (rand() % (max_workload - min_workload + 1));
     int workload = 0;
     MPI_Irecv(NULL, 0, MPI_BYTE, 0, TAG_SOLVED, MPI_COMM_WORLD, &solved_request);
     node_stack = dynarray_create(s->grid_size * s->grid_size);
     Node *node;
-    int n_threads = N_THREADS;
 
     if(n_threads < 1)
     {
@@ -723,7 +697,7 @@ int solve_sudoku(sudoku *s)
     {
         int values_size = s->grid_size * sizeof(cell_v);
         int node_size = values_size + 4; //+4: d + i + j + digits_count (4 bytes no total)
-        int msg_size = node_size * MAX_NODES_PER_MESSAGE + 1; //+1: 1 byte para indicar quantos nós foram enviados/recebidos (nodes_amount)
+        int msg_size = node_size * max_nodes_per_message + 1; //+1: 1 byte para indicar quantos nós foram enviados/recebidos (nodes_amount)
         char msg_buffer[msg_size];
         void *buffer_pos;
         int nodes_amount;
@@ -775,7 +749,7 @@ int solve_sudoku(sudoku *s)
                     pthread_create(&threads[i], NULL, thread_search, &threadArgs[i]);
                 }
 
-                int min_workload = INT_MAX;
+                int min_wl_remaining = INT_MAX;
 
                 for(int i = 0; i < n_threads; i++)
                 {
@@ -786,13 +760,13 @@ int solve_sudoku(sudoku *s)
                         return 1;
                     }
 
-                    if(threadArgs[i].workload < min_workload)
+                    if(threadArgs[i].workload < min_wl_remaining)
                     {
-                        min_workload = threadArgs[i].workload;
+                        min_wl_remaining = threadArgs[i].workload;
                     }
                 }
 
-                workload = min_workload;
+                workload = min_wl_remaining;
                 
                 if(!workload)
                 {
@@ -801,7 +775,7 @@ int solve_sudoku(sudoku *s)
                         nodes_amount = 0;
                         buffer_pos = msg_buffer;
 
-                        for(int i = 0; i < MAX_NODES_PER_MESSAGE; i++)
+                        for(int i = 0; i < max_nodes_per_message; i++)
                         {
                             node = dynarray_remove_tail(node_stack);
 
@@ -931,7 +905,7 @@ int coordinate(sudoku *s)
     MPI_Status status;
     int values_size = s->grid_size * sizeof(cell_v);
     int node_size = values_size + 4; //+4: d + i + j + digits_count (4 bytes no total)
-    int msg_size = node_size * MAX_NODES_PER_MESSAGE + 1; //+1: 1 byte para indicar quantos nós foram enviados
+    int msg_size = node_size * max_nodes_per_message + 1; //+1: 1 byte para indicar quantos nós foram enviados
     char msg_buffer[msg_size];
     void *buffer_pos;
     char solved_buffer[values_size];
@@ -951,7 +925,7 @@ int coordinate(sudoku *s)
                 nodes_amount = 0;
                 buffer_pos = msg_buffer;
 
-                for(int i = 0; i < COORD_SEND_NODES_AMOUNT; i++)
+                for(int i = 0; i < coord_send_nodes_amount; i++)
                 {
                     node = minheap_remove_min(nodes);
 
@@ -1043,10 +1017,10 @@ int coordinate(sudoku *s)
                 buffer_pos = solved_buffer;
 
                 FILE *results = fopen("results.txt", "a");
-                fprintf(results, "%d,%d,%d,%d,%d,%d,%lf\n", MAX_WORKLOAD, MIN_WORKLOAD, MAX_NODES_PER_MESSAGE, COORD_SEND_NODES_AMOUNT, mpi_size, N_THREADS, elapsed_time);
+                fprintf(results, "%d,%d,%d,%d,%d,%d,%lf\n", max_workload, min_workload, max_nodes_per_message, coord_send_nodes_amount, mpi_size, n_threads, elapsed_time);
                 fclose(results);
 
-                //MPI_Abort(MPI_COMM_WORLD, MPI_SUCCESS);
+                MPI_Abort(MPI_COMM_WORLD, MPI_SUCCESS);
 
                 for(int i = 0; i < s->dim; i++, buffer_pos += s->dim * sizeof(cell_v))
                 {
@@ -1087,11 +1061,35 @@ int coordinate(sudoku *s)
     return 0;
 }
 
+str2int_errno str2int(int *out, char *s, int base) {
+    char *end;
+    if (s[0] == '\0' || isspace(s[0]))
+        return STR2INT_INCONVERTIBLE;
+    errno = 0;
+    long l = strtol(s, &end, base);
+
+    if (l > INT_MAX || (errno == ERANGE && l == LONG_MAX))
+        return STR2INT_OVERFLOW;
+    if (l < INT_MIN || (errno == ERANGE && l == LONG_MIN))
+        return STR2INT_UNDERFLOW;
+    if (*end != '\0')
+        return STR2INT_INCONVERTIBLE;
+    *out = l;
+    return STR2INT_SUCCESS;
+}
+
 int main (int argc, char **argv)
 {
     MPI_Init(&argc, &argv);
     MPI_Comm_size(MPI_COMM_WORLD, &mpi_size);
     MPI_Comm_rank(MPI_COMM_WORLD, &mpi_rank);
+
+    assert(argc == 6);
+    assert(str2int(&max_workload, argv[1], 10) == STR2INT_SUCCESS);
+    assert(str2int(&min_workload, argv[2], 10) == STR2INT_SUCCESS);
+    assert(str2int(&max_nodes_per_message, argv[3], 10) == STR2INT_SUCCESS);
+    assert(str2int(&coord_send_nodes_amount, argv[4], 10) == STR2INT_SUCCESS);
+    assert(str2int(&n_threads, argv[5], 10) == STR2INT_SUCCESS);
 
     if(mpi_size < 2)
     {
