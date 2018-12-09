@@ -4,9 +4,13 @@
 #include "dynarray.h"
  
 #define START_SIZE 4 /* Initial buffer size if not specified */
+
+pthread_mutex_t lock;
  
 dynarray * dynarray_create(unsigned int size)
 {
+    pthread_mutex_init(&lock, NULL);
+
     dynarray * array = malloc(sizeof(dynarray));
     if (array != NULL) {
         if (size) {
@@ -35,6 +39,7 @@ void dynarray_empty(dynarray * array)
  
 void dynarray_delete(dynarray * array)
 {
+    pthread_mutex_destroy(&lock);
     if (array) {
         free(array->buffer);
         free(array);
@@ -43,6 +48,7 @@ void dynarray_delete(dynarray * array)
  
 void dynarray_add_tail(dynarray * array, void * data)
 {
+    pthread_mutex_lock(&lock);
     if (array->count == array->size) {
         /* No more space */
         if (array->buffer != NULL) {
@@ -59,10 +65,12 @@ void dynarray_add_tail(dynarray * array, void * data)
         array->buffer[array->count] = data;
         array->count++;
     }
+    pthread_mutex_unlock(&lock);
 }
  
 void dynarray_add_head(dynarray * array, void * data)
 {
+    pthread_mutex_lock(&lock);
     if (array->count == array->size) {
         /* No more space */
         if (array->buffer != NULL) {
@@ -90,20 +98,25 @@ void dynarray_add_head(dynarray * array, void * data)
         array->buffer[0] = data;
         array->count++;
     }
+    pthread_mutex_unlock(&lock);
 }
  
 void * dynarray_remove_tail(dynarray * array)
 {
+    pthread_mutex_lock(&lock);
     void * data = NULL;
     if (array->count > 0) {
         data = array->buffer[array->count - 1];
         array->count--;
     }
+    pthread_mutex_unlock(&lock);
+
     return data;
 }
  
 void * dynarray_remove_head(dynarray * array)
 {
+    pthread_mutex_lock(&lock);
     void * data = NULL;
     if (array->count > 0) {
         data = array->buffer[0];
@@ -111,6 +124,7 @@ void * dynarray_remove_head(dynarray * array)
         memmove(array->buffer, array->buffer + 1, (array->count - 1) * sizeof(void*));
         array->count--;
     }
+    pthread_mutex_unlock(&lock);
     return data;
 }
  
@@ -217,5 +231,11 @@ void dynarray_for_each(const dynarray * array, dynarray_forfn fun)
  
 unsigned int dynarray_get_count(const dynarray * array)
 {
-    return array->count;
+    unsigned int count;
+
+    pthread_mutex_lock(&lock);
+    count = array->count;
+    pthread_mutex_unlock(&lock);
+    
+    return count;
 }

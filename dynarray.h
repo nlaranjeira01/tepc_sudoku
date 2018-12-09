@@ -1,5 +1,7 @@
 #ifndef DYNARRAY_H
 #define DYNARRAY_H
+
+#include <pthread.h>
  
 struct dynarray {
     void ** buffer;

@@ -19,16 +19,34 @@
 #include <unistd.h>
 #include <string.h>
 #include <mpi.h>
+#include <sys/time.h>
 #include "minheap.h"
 
 #define INT_TYPE unsigned long long 
 #define INT_TYPE_SIZE (sizeof(INT_TYPE) * 8)
 #define CELL_VAL_SIZE 1
 #define MAX_BDIM 8
-#define MAX_WORKLOAD 4000
-#define MIN_WORKLOAD 3500
-#define MAX_NODES_PER_MESSAGE 20
-#define COORD_SEND_NODES_AMOUNT 4
+
+#ifndef MAX_WORKLOAD
+    #define MAX_WORKLOAD 1000
+#endif
+
+#ifndef MIN_WORKLOAD
+    #define MIN_WORKLOAD 500
+#endif
+
+#ifndef MAX_NODES_PER_MESSAGE
+    #define MAX_NODES_PER_MESSAGE 5
+#endif
+
+#ifndef COORD_SEND_NODES_AMOUNT
+    #define COORD_SEND_NODES_AMOUNT 4
+#endif
+
+#ifndef N_THREADS
+    #define N_THREADS 1
+#endif
+
 #define TAG_SIZE 1
 #define TAG_NEW_JOB 2
 #define TAG_ADD_NODES 3
@@ -43,9 +61,11 @@ enum SOLVE_STRATEGY {SUDOKU_SOLVE, SUDOKU_COUNT_SOLS};
 
 #define BUILD_ERROR_IF(condition) ((void)sizeof(char[1 - 2*!!(condition)]))
 
-int mpi_rank, mpi_size;
+int mpi_rank, mpi_size, stop_threads = 0;
 dynarray *node_stack;
 MPI_Request solved_request;
+pthread_mutex_t solved_lock;
+struct timeval start_time, end_time;
 
 void BUILD_TIME_CHECKS()
 {
@@ -85,6 +105,13 @@ typedef struct Node
     char digit;
     unsigned int value;
 }Node;
+
+typedef struct ThreadArgs
+{
+    sudoku *s;
+    int workload;
+    int ret;
+}ThreadArgs;
 
 static int assign (sudoku *s, int i, int j, int d);
 
@@ -456,11 +483,17 @@ static void display(sudoku *s)
 
 static int search (sudoku *s, int status, int *workload)
 {
+    if(stop_threads)
+    {
+        return 1;
+    }
+
     int flag;
     MPI_Test(&solved_request, &flag, MPI_STATUS_IGNORE);
 
     if(flag)
     {
+        stop_threads = 1;
         return 1;
     }
 
@@ -486,6 +519,13 @@ static int search (sudoku *s, int status, int *workload)
 
     if(solved)
     {
+        pthread_mutex_lock(&solved_lock);
+
+        if(stop_threads)
+        {
+            return 1;
+        }
+        stop_threads = 1;
         char solved_buffer[s->grid_size * sizeof(cell_v)];
         void *buffer_pos = solved_buffer;
 
@@ -495,6 +535,7 @@ static int search (sudoku *s, int status, int *workload)
         }
 
         MPI_Send(solved_buffer, s->grid_size * sizeof(cell_v), MPI_BYTE, 0, TAG_SOLVED, MPI_COMM_WORLD);
+        pthread_mutex_unlock(&solved_lock);
 
         return 1;
     }
@@ -602,6 +643,59 @@ static int search (sudoku *s, int status, int *workload)
     return ret;
 }
 
+void *thread_search(void *_args)
+{
+    ThreadArgs *args = (ThreadArgs*)_args;
+    Node *node;
+    int workload = args->workload;
+    sudoku *s = args->s;
+    args->ret = 0;  //assumimos primeiramente que não chegaremos à solução
+
+    while(workload)
+    {
+        if(!dynarray_get_count(node_stack))
+        {
+            workload = 0;   //para poder pedir novos nós
+            break;
+        }
+        
+        node = dynarray_remove_tail(node_stack);
+
+        if(!node)
+        {
+            printf("solve_sudoku: nó nulo encontrado na stack...\n");
+            continue;
+        }
+
+        s->values = node->values;
+        
+        if(!assign(s, node->sqrI, node->sqrJ, node->digit))
+        {
+            for(int i = 0; i < s->dim; i++)
+            {
+                free(node->values[i]);
+            }
+
+            free(node->values);
+            free(node);
+            node = NULL;
+            continue;
+        }
+        
+        free(node);
+
+        if(search(s, 1, &workload))
+        {
+            args->ret = 1;
+            break;
+        }
+    }
+
+    args->workload = workload;
+
+    return NULL;
+}
+
 int solve_sudoku(sudoku *s)
 {
     int workload_bkp = MIN_WORKLOAD + (rand() % (MAX_WORKLOAD - MIN_WORKLOAD + 1));
@@ -609,6 +703,23 @@ int solve_sudoku(sudoku *s)
     MPI_Irecv(NULL, 0, MPI_BYTE, 0, TAG_SOLVED, MPI_COMM_WORLD, &solved_request);
     node_stack = dynarray_create(s->grid_size * s->grid_size);
     Node *node;
+    int n_threads = N_THREADS;
+
+    if(n_threads < 1)
+    {
+        n_threads = 1;
+    }
+
+    pthread_t threads[n_threads];
+    ThreadArgs threadArgs[n_threads];
+
+    for(int i = 0; i < n_threads; i++)
+    {
+        threadArgs[i].s = malloc(sizeof(sudoku));
+        memcpy(threadArgs[i].s, s, sizeof(sudoku));
+
+        printf("aahhahaha %d\n", threadArgs[i].s->dim);
+    }
 
     if(s)
     {
@@ -659,40 +770,31 @@ int solve_sudoku(sudoku *s)
 
             while(1)
             {
-                if(!dynarray_get_count(node_stack))
-                {
-                    workload = 0;   //para poder pedir novos nós
-                    break;
-                }
-                
-                node = dynarray_remove_tail(node_stack);
 
-                if(!node)
+                for(int i = 0; i < n_threads; i++)
                 {
-                    printf("solve_sudoku: nó nulo encontrado na stack...\n");
-                    continue;
+                    threadArgs[i].workload = workload;
+                    pthread_create(&threads[i], NULL, thread_search, &threadArgs[i]);
                 }
 
-                s->values = node->values;
-                
-                if(!assign(s, node->sqrI, node->sqrJ, node->digit))
+                int min_workload = INT_MAX;
+
+                for(int i = 0; i < n_threads; i++)
                 {
-                    for(int i = 0; i < s->dim; i++)
+                    pthread_join(threads[i], NULL);
+
+                    if(threadArgs[i].ret)
                     {
-                        free(node->values[i]);
+                        return 1;
                     }
 
-                    free(node->values);
-                    free(node);
-                    node = NULL;
-                    continue;
+                    if(threadArgs[i].workload < min_workload)
+                    {
+                        min_workload = threadArgs[i].workload;
+                    }
                 }
-                
-                if(search(s, 1, &workload))
-                {
-                    destroy_sudoku(s);
-                    return 1;
-                }
+
+                workload = min_workload;
                 
                 if(!workload)
                 {
@@ -933,18 +1035,27 @@ int coordinate(sudoku *s)
                     break;
                 }
 
+                gettimeofday(&end_time, NULL);
+                double elapsed_time = (((end_time.tv_sec * 1000000 + end_time.tv_usec) - (start_time.tv_sec * 1000000 + start_time.tv_usec)))/1000000.0;
+
                 MPI_Recv(&solved_buffer, values_size, MPI_BYTE, status.MPI_SOURCE, TAG_SOLVED, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
 
                 printf("Puzzle resolvido pelo processo %d:\n", status.MPI_SOURCE);
 
                 buffer_pos = solved_buffer;
 
+                FILE *results = fopen("results.txt", "a");
+                fprintf(results, "%d,%d,%d,%d,%d,%d,%lf\n", MAX_WORKLOAD, MIN_WORKLOAD, MAX_NODES_PER_MESSAGE, COORD_SEND_NODES_AMOUNT, mpi_size, N_THREADS, elapsed_time);
+                fclose(results);
+
+                MPI_Abort(MPI_COMM_WORLD, MPI_SUCCESS);
+
                 for(int i = 0; i < s->dim; i++, buffer_pos += s->dim * sizeof(cell_v))
                 {
                     memcpy(s->values[i], buffer_pos, s->dim * sizeof(cell_v));    
                 }
 
-                display(s);
+                //display(s);
 
                 for(int i = 1; i < mpi_size; i++)
                 {
@@ -989,6 +1100,8 @@ int main (int argc, char **argv)
         printf("É preciso de no mínimo 2 processos\n");
         return 0;
     }
+    gettimeofday(&start_time, NULL);
+    pthread_mutex_init(&solved_lock, NULL);
 
     if(!mpi_rank)
     {
@@ -1043,6 +1156,7 @@ int main (int argc, char **argv)
         MPI_Send(NULL, 0, MPI_BYTE, 0, TAG_TERMINATED, MPI_COMM_WORLD);
     }
 
+    pthread_mutex_destroy(&solved_lock);
     MPI_Finalize();
 
     return 0;
